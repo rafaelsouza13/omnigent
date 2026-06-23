@@ -58,7 +58,12 @@ import { parseSystemMessage } from "@/lib/systemMessage";
 import { Button } from "@/components/ui/button";
 import { OttoIcon } from "@/components/icons/OttoIcon";
 import { cn } from "@/lib/utils";
-import { isIOSShell, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+import {
+  isIOSShell,
+  onNativeViewModeChanged,
+  setNativeServerSwitcherHidden,
+  setNativeViewMode,
+} from "@/lib/nativeBridge";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -1164,18 +1169,26 @@ export function shouldShowTerminalSurface(
   );
 }
 
-function useNativeServerSwitcherForMainSurface(surface: HTMLElement | null, active: boolean) {
+/**
+ * Tracks whether `surface` is the frontmost element at its own centre — i.e.
+ * not covered by a drawer / sidebar / sheet. Returns false when inactive,
+ * outside the iOS shell, or while obscured. Re-checks on the layout signals a
+ * drawer transition emits (mutations, transitions, viewport changes). Both the
+ * native server switcher and the native Chat/Terminal bar hide off this signal
+ * so neither floats over an opened panel.
+ */
+function useSurfaceFrontmost(surface: HTMLElement | null, active: boolean): boolean {
+  const [frontmost, setFrontmost] = useState(false);
   useEffect(() => {
-    if (!isIOSShell()) return;
-    if (!active) {
-      setNativeServerSwitcherHidden(true);
+    if (!isIOSShell() || !active) {
+      setFrontmost(false);
       return;
     }
 
     let frame = 0;
     const sync = () => {
       frame = 0;
-      setNativeServerSwitcherHidden(!isSurfaceFrontmost(surface));
+      setFrontmost(isSurfaceFrontmost(surface));
     };
     const schedule = () => {
       if (frame !== 0) cancelAnimationFrame(frame);
@@ -1215,9 +1228,10 @@ function useNativeServerSwitcherForMainSurface(surface: HTMLElement | null, acti
       window.removeEventListener("focusout", schedule, true);
       window.visualViewport?.removeEventListener("resize", schedule);
       window.visualViewport?.removeEventListener("scroll", schedule);
-      setNativeServerSwitcherHidden(true);
+      setFrontmost(false);
     };
   }, [active, surface]);
+  return frontmost;
 }
 
 function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
@@ -1230,7 +1244,29 @@ function isSurfaceFrontmost(surface: HTMLElement | null): boolean {
   const x = clamp(window.innerWidth / 2, rect.left + xInset, rect.right - xInset);
   const y = clamp(rect.top + rect.height * 0.38, rect.top + yInset, rect.bottom - yInset);
   const topElement = document.elementFromPoint(x, y);
-  return topElement !== null && surface.contains(topElement);
+
+  // A Radix dropdown / select / popover sets `pointer-events: none` on the body
+  // while open WITHOUT covering the surface, so elementFromPoint falls through
+  // to the document root (or null). That's a transient layer, not a panel —
+  // keep the surface "frontmost" so the native overlays don't blink out.
+  if (
+    !topElement ||
+    topElement === document.documentElement ||
+    topElement === document.body
+  ) {
+    return true;
+  }
+  // Likewise if a popover/menu/listbox actually covers the probe point: those
+  // are transient, unlike a persistent drawer/sidebar/sheet.
+  if (
+    topElement.closest(
+      '[data-radix-popper-content-wrapper], [role="menu"], [role="listbox"], [role="tooltip"]',
+    )
+  ) {
+    return true;
+  }
+
+  return surface.contains(topElement);
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -1349,10 +1385,20 @@ function MainAgentSurface({
     setContainerEl(el);
   }, []);
   const [terminalSurfaceEl, setTerminalSurfaceEl] = useState<HTMLElement | null>(null);
-  useNativeServerSwitcherForMainSurface(
+  // True only while the chat/terminal surface is the frontmost thing on screen.
+  // Drives both native overlays so neither floats over an opened drawer.
+  const surfaceFrontmost = useSurfaceFrontmost(
     showTerminal ? terminalSurfaceEl : containerEl,
     !!conversationId,
   );
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    setNativeServerSwitcherHidden(!surfaceFrontmost);
+  }, [surfaceFrontmost]);
+  useEffect(() => {
+    if (!isIOSShell()) return;
+    return () => setNativeServerSwitcherHidden(true);
+  }, []);
   // The conversation's scroll container + the StickToBottom controls needed to
   // override its bottom-lock, lifted out of the context by
   // ConversationScrollRefBridge so the pinned-but-unmasked JumpToTopButton can
@@ -1405,7 +1451,11 @@ function MainAgentSurface({
           // agent via the composer instead. Server enforces this too.
           readOnly={!isOwnerLevel(permissionLevel)}
         />
-        <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+        <ConnectionIndicator
+          liveness={liveness}
+          onShowReconnectHelp={onShowReconnectHelp}
+          surfaceFrontmost={surfaceFrontmost}
+        />
       </>
     );
   }
@@ -1557,7 +1607,11 @@ function MainAgentSurface({
       {/* Chat/Terminal toggle for terminal-first sessions, reconnect-or-
           fork banner when unreachable, nothing otherwise. Sits below the
           composer so its position is consistent with the terminal view. */}
-      <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
+      <ConnectionIndicator
+        liveness={liveness}
+        onShowReconnectHelp={onShowReconnectHelp}
+        surfaceFrontmost={surfaceFrontmost}
+      />
     </>
   );
 }
@@ -2102,9 +2156,13 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
+  surfaceFrontmost = true,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
+  // Whether the chat/terminal surface is frontmost (not under a drawer). Gates
+  // the native iOS bar so it doesn't float over an opened sidebar/panel.
+  surfaceFrontmost?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
   const keyboardVisible = useIOSNativeKeyboardVisible(
@@ -2112,6 +2170,27 @@ export function ConnectionIndicator({
     terminalFirst?.view === "chat",
   );
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+  // Genuinely-unreachable states get the reconnect banner, for
+  // both terminal-first and regular sessions. `runner_asleep` (host up,
+  // runner relaunches on the next message) and `unknown` (pre-poll) are
+  // NOT unreachable — they're handled below.
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+
+  // In the iOS shell the Chat/Terminal toggle is the native Liquid Glass bar,
+  // not the in-page pill. Drive it from here (always mounted) with the SAME
+  // visibility the pill would have, expressed as a stable boolean so switching
+  // views never flickers the bar. Hook is called unconditionally (before any
+  // early return) to satisfy the rules of hooks.
+  const nativeBarVisible =
+    isIOSShell() &&
+    terminalFirst?.isTerminalFirst === true &&
+    !terminalFirst.isShellView &&
+    sandboxStatus?.stage !== "failed" &&
+    !unreachable &&
+    !keyboardVisible &&
+    surfaceFrontmost;
+  useNativeChatTerminalBar(terminalFirst, nativeBarVisible);
+
   if (sandboxStatus !== null) {
     // A failed launch owns this band with its reason. An IN-FLIGHT
     // launch renders in the chat thread (RunnerStartingIndicator)
@@ -2122,11 +2201,6 @@ export function ConnectionIndicator({
     }
     return null;
   }
-  // Genuinely-unreachable states get the reconnect banner, for
-  // both terminal-first and regular sessions. `runner_asleep` (host up,
-  // runner relaunches on the next message) and `unknown` (pre-poll) are
-  // NOT unreachable — they're handled below.
-  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
   if (unreachable) {
     return (
       <button
@@ -2158,6 +2232,22 @@ export function ConnectionIndicator({
   // as the runner comes back. The strict `runner_online` still gates the
   // inline PTY *view* (it needs a live tunnel) — but not the toggle.
   if (terminalFirst?.isTerminalFirst) {
+    // In the iOS shell the toggle is the native bar (driven above). Render only
+    // a spacer reserving its fixed footprint so the composer clears it — and
+    // nothing when the bar is hidden.
+    if (isIOSShell()) {
+      // Chat reserves a touch less than terminal: the composer's own bottom
+      // content (the status line) already cushions the gap to the bar.
+      return nativeBarVisible ? (
+        <div
+          aria-hidden
+          className={cn(
+            "omnigent-native-bottom-spacer",
+            terminalFirst.view === "chat" && "omnigent-native-bottom-spacer--chat",
+          )}
+        />
+      ) : null;
+    }
     // A rail-opened shell owns the main view chrome-free — no pill: a
     // "Chat" option under someone else's shell misreads as the shell
     // being the agent. The shell view carries its own close affordance
@@ -2267,8 +2357,53 @@ export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }
 }
 
 /**
+ * Mirrors the Chat/Terminal state onto the iOS shell's native Liquid Glass
+ * switcher and routes its taps back into `setView`. Driven by a stable
+ * `visible` boolean (not this hook's mount/unmount), so toggling Chat/Terminal
+ * updates the bar in place instead of flickering it hidden→shown. A no-op
+ * outside the iOS shell; the caller renders its own in-page pill there.
+ */
+function useNativeChatTerminalBar(
+  ctx: ReturnType<typeof useTerminalFirst> | null,
+  visible: boolean,
+): void {
+  const native = isIOSShell();
+  const view = ctx?.view ?? "chat";
+  const terminalsAvailable = ctx?.terminalsAvailable ?? false;
+  const terminalStartingUp = ctx?.terminalStartingUp ?? false;
+
+  // Keep `setView` reachable from the subscribe-once effect without
+  // resubscribing whenever the callback identity changes.
+  const setViewRef = useRef(ctx?.setView);
+  setViewRef.current = ctx?.setView;
+
+  // Push current state + visibility down whenever any of it changes.
+  useEffect(() => {
+    if (!native) return;
+    setNativeViewMode({ mode: view, terminalEnabled: terminalsAvailable, terminalStartingUp, visible });
+  }, [native, view, terminalsAvailable, terminalStartingUp, visible]);
+
+  // Belt-and-suspenders: hide the bar if the host component ever unmounts.
+  useEffect(() => {
+    if (!native) return;
+    return () => {
+      setNativeViewMode({ mode: "chat", terminalEnabled: false, terminalStartingUp: false, visible: false });
+    };
+  }, [native]);
+
+  // Route native taps back into the web layer.
+  useEffect(() => {
+    if (!native) return;
+    return onNativeViewModeChanged((mode) => setViewRef.current?.(mode));
+  }, [native]);
+}
+
+/**
  * Chat/Terminal segmented control for terminal-first sessions. Status
  * lives in the sidebar — this band is purely a view toggle.
+ *
+ * Only rendered outside the iOS shell; inside it the switcher is drawn natively
+ * (Liquid Glass) over the web view — see {@link useNativeChatTerminalBar}.
  */
 function ConnectedTerminalFirstPill({
   ctx,
@@ -2281,6 +2416,7 @@ function ConnectedTerminalFirstPill({
   // reachable: greyed-and-spinning reads as "loading", greyed-and-static as
   // "no terminal / stopped".
   const { view, setView, terminalsAvailable, terminalStartingUp } = ctx;
+
   return (
     <div
       className={cn(
