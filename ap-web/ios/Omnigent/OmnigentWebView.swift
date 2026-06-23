@@ -31,13 +31,24 @@ struct OmnigentWebView: UIViewRepresentable {
     let webView = AccessoryFreeWebView(frame: .zero, configuration: configuration)
     webView.navigationDelegate = context.coordinator
     webView.uiDelegate = context.coordinator
-    webView.allowsBackForwardNavigationGestures = true
+    // The left-edge swipe is repurposed to open the web app's sidebar (see the
+    // edge-pan recognizer below), so the native back/forward gesture is off —
+    // the two would otherwise fight over the same edge.
+    webView.allowsBackForwardNavigationGestures = false
     webView.isFindInteractionEnabled = true
     webView.isOpaque = false
     webView.backgroundColor = .clear
     webView.underPageBackgroundColor = .clear
     webView.scrollView.backgroundColor = .clear
     webView.scrollView.contentInsetAdjustmentBehavior = .never
+
+    let edgePan = UIScreenEdgePanGestureRecognizer(
+      target: context.coordinator,
+      action: #selector(Coordinator.handleLeftEdgePan(_:))
+    )
+    edgePan.edges = .left
+    edgePan.delegate = context.coordinator
+    webView.addGestureRecognizer(edgePan)
 
     model.webView = webView
     context.coordinator.attach(webView)
@@ -114,6 +125,17 @@ struct OmnigentWebView: UIViewRepresentable {
         }
       },
     });
+    const openSidebarCallbacks = new Set();
+    Object.defineProperty(window, "__omnigentNativeEmitOpenSidebar", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value() {
+        for (const callback of openSidebarCallbacks) {
+          try { callback(); } catch {}
+        }
+      },
+    });
     window.omnigentNative = Object.freeze({
       kind: "ios",
       setBadgeCount(count) {
@@ -139,6 +161,11 @@ struct OmnigentWebView: UIViewRepresentable {
         callbacks.add(callback);
         return () => callbacks.delete(callback);
       },
+      onOpenSidebar(callback) {
+        if (typeof callback !== "function") return () => {};
+        openSidebarCallbacks.add(callback);
+        return () => openSidebarCallbacks.delete(callback);
+      },
       setServerSwitcherHidden(hidden) {
         window.webkit.messageHandlers.omnigentNative.postMessage({
           method: "setServerSwitcherHidden",
@@ -156,7 +183,7 @@ struct OmnigentWebView: UIViewRepresentable {
   """
 
   @MainActor
-  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
+  final class Coordinator: NSObject, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler, UIGestureRecognizerDelegate {
     var parent: OmnigentWebView
     private weak var webView: WKWebView?
     private(set) var pinnedURL: URL?
@@ -172,6 +199,22 @@ struct OmnigentWebView: UIViewRepresentable {
 
     func detach() {
       webView = nil
+    }
+
+    // A left-edge swipe asks the web app to open its sidebar. Firing on
+    // `.began` makes the sidebar appear as soon as the swipe is recognized,
+    // matching the immediacy of the native back gesture it replaces.
+    @objc func handleLeftEdgePan(_ recognizer: UIScreenEdgePanGestureRecognizer) {
+      guard recognizer.state == .began else { return }
+      parent.model.emitOpenSidebar()
+    }
+
+    // Let the edge swipe coexist with the page's own scrolling/pan gestures.
+    func gestureRecognizer(
+      _ gestureRecognizer: UIGestureRecognizer,
+      shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
+    ) -> Bool {
+      true
     }
 
     func load(_ url: URL, in webView: WKWebView) {

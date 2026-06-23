@@ -25,6 +25,10 @@ final class WebViewModel: ObservableObject {
     webView?.evaluateJavaScript(script)
   }
 
+  func emitOpenSidebar() {
+    webView?.evaluateJavaScript("window.__omnigentNativeEmitOpenSidebar?.();")
+  }
+
   static func javascriptString(_ value: String) -> String {
     guard let data = try? JSONEncoder().encode(value),
           let encoded = String(data: data, encoding: .utf8) else {

@@ -8,7 +8,7 @@ import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
-import { isIOSShell, isMacElectronShell } from "@/lib/nativeBridge";
+import { isIOSShell, isMacElectronShell, onNativeOpenSidebar } from "@/lib/nativeBridge";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   Dialog,
@@ -126,6 +126,9 @@ export function AppShell() {
     useResizableInlinePanel(conversationId ?? null, inlinePanelMinWidth);
   const [searchParams, setSearchParams] = useSearchParams();
   const [sidebarOpen, setSidebarOpen] = useState(initialSidebarOpen);
+  // The iOS shell repurposes the left-edge swipe (normally back-navigation) to
+  // open the sidebar, surfacing it through the native bridge. No-op elsewhere.
+  useEffect(() => onNativeOpenSidebar(() => setSidebarOpen(true)), []);
   const [selectedFilePath, setSelectedFilePath] = useState<string | null>(() =>
     conversationId ? (readSessionWorkspaceState(conversationId).selectedFilePath ?? null) : null,
   );

@@ -6,6 +6,7 @@ import {
   isNativeShell,
   nativeNotify,
   onNativeNotificationActivated,
+  onNativeOpenSidebar,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
 } from "./nativeBridge";
@@ -21,6 +22,8 @@ const iosSetBadge = vi.fn();
 const iosNotify = vi.fn().mockResolvedValue(true);
 const iosUnsubscribe = vi.fn();
 const iosOnNotificationActivated = vi.fn().mockReturnValue(iosUnsubscribe);
+const iosOnOpenSidebarUnsubscribe = vi.fn();
+const iosOnOpenSidebar = vi.fn().mockReturnValue(iosOnOpenSidebarUnsubscribe);
 const iosSetServerSwitcherHidden = vi.fn();
 const iosSetSidebarOpen = vi.fn();
 
@@ -56,6 +59,7 @@ function setIOS(on: boolean, withClickRouting = true): void {
       notify: (...args: unknown[]) => iosNotify(...args),
       setServerSwitcherHidden: (...args: unknown[]) => iosSetServerSwitcherHidden(...args),
       setSidebarOpen: (...args: unknown[]) => iosSetSidebarOpen(...args),
+      onOpenSidebar: (...args: unknown[]) => iosOnOpenSidebar(...args),
       ...(withClickRouting
         ? {
             onNotificationActivated: (...args: unknown[]) => iosOnNotificationActivated(...args),
@@ -199,6 +203,43 @@ describe("onNativeNotificationActivated", () => {
       throw new Error("ipc down");
     });
     const unsubscribe = onNativeNotificationActivated(vi.fn());
+    expect(() => unsubscribe()).not.toThrow();
+  });
+});
+
+describe("onNativeOpenSidebar", () => {
+  it("returns a no-op unsubscribe outside any native shell", () => {
+    setIOS(false);
+    const cb = vi.fn();
+    const unsubscribe = onNativeOpenSidebar(cb);
+    expect(iosOnOpenSidebar).not.toHaveBeenCalled();
+    expect(() => unsubscribe()).not.toThrow();
+  });
+
+  it("subscribes through the iOS bridge and returns its unsubscribe", () => {
+    setIOS(true);
+    const cb = vi.fn();
+    const unsubscribe = onNativeOpenSidebar(cb);
+    expect(iosOnOpenSidebar).toHaveBeenCalledWith(cb);
+    unsubscribe();
+    expect(iosOnOpenSidebarUnsubscribe).toHaveBeenCalledOnce();
+  });
+
+  it("returns a no-op unsubscribe under a shell lacking the gesture hook", () => {
+    setIOS(true);
+    delete (window as unknown as { omnigentNative: Record<string, unknown> }).omnigentNative
+      .onOpenSidebar;
+    const unsubscribe = onNativeOpenSidebar(vi.fn());
+    expect(iosOnOpenSidebar).not.toHaveBeenCalled();
+    expect(() => unsubscribe()).not.toThrow();
+  });
+
+  it("returns a no-op unsubscribe when the bridge throws", () => {
+    setIOS(true);
+    iosOnOpenSidebar.mockImplementationOnce(() => {
+      throw new Error("bridge down");
+    });
+    const unsubscribe = onNativeOpenSidebar(vi.fn());
     expect(() => unsubscribe()).not.toThrow();
   });
 });

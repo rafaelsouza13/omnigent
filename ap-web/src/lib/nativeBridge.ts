@@ -42,6 +42,12 @@ interface NativeShellApi {
    */
   onNotificationActivated?: (callback: (path: string) => void) => () => void;
   /**
+   * Subscribe to a native request to open the app sidebar. The iOS shell fires
+   * this on a left-edge swipe (where it has repurposed the gesture that would
+   * otherwise navigate back). Returns an unsubscribe.
+   */
+  onOpenSidebar?: (callback: () => void) => () => void;
+  /**
    * Let native chrome react to web UI state. The iOS shell uses this to show
    * its floating server switcher only when the chat transcript is visible.
    */
@@ -181,6 +187,26 @@ export function onNativeNotificationActivated(callback: (path: string) => void):
     return native.onNotificationActivated(callback);
   } catch (err) {
     console.warn("[nativeBridge] native onNotificationActivated failed:", err);
+    return () => {};
+  }
+}
+
+/**
+ * Subscribe to native requests to open the app sidebar. The iOS shell fires
+ * this on a left-edge swipe (the gesture it repurposed from back-navigation),
+ * so the renderer can open its sidebar in response.
+ *
+ * Returns an unsubscribe function. A no-op (returning a no-op unsubscribe)
+ * outside a native shell or under a shell too old to support the gesture, so
+ * callers can register it unconditionally.
+ */
+export function onNativeOpenSidebar(callback: () => void): () => void {
+  const native = nativeApi();
+  if (!native?.onOpenSidebar) return () => {};
+  try {
+    return native.onOpenSidebar(callback);
+  } catch (err) {
+    console.warn("[nativeBridge] native onOpenSidebar failed:", err);
     return () => {};
   }
 }
